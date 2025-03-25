@@ -77,31 +77,22 @@ class ProjectService:
             logging.error(f"Error in fetch_projects: {str(e)}", exc_info=True)
             raise
 
-    def prepare_hierarchy(self, projects: List[dict], timezone: str) -> List[dict]:
+    def prepare_hierarchy(self, projects: List[dict], timezone: str, is_archived: bool) -> List[dict]:
         def format_project_data(project: dict, project_names: List[str]) -> dict:
             if not isinstance(project, dict):
                 logging.warning(f"Invalid project data received: {project}")
                 return None
-
+            
             info = project.get('projectInfo') or {}
             group = project.get('projectGroup') or {}
 
             try:
                 # Fill empty project names with empty strings
                 project_names.extend([""] * (7 - len(project_names)))
-                
-                # Default values for India if lat/long are missing
-                default_lat = 20.593684
-                default_long = 78.96288
-                default_radius = 100
 
-                # Format dates properly
+                # Format dates
                 created_on = convert_utc_to_timezone(project.get('createdOn'), timezone)
                 updated_on = convert_utc_to_timezone(project.get('updatedOn'), timezone)
-                
-                if not created_on or not updated_on:
-                    logging.error(f"Date conversion failed for project {project.get('id')}")
-                    logging.error(f"createdOn: {project.get('createdOn')}, updatedOn: {project.get('updatedOn')}")
 
                 return {
                     "id": project.get('id', ''),
@@ -113,62 +104,82 @@ class ProjectService:
                     "state": info.get('state', ''),
                     "postal_code": info.get('postalCode', ''),
                     "phone": info.get('phone', ''),
-                    "project_names": project_names[:7],  # Ensure exactly 7 elements
+                    "project_names": project_names[:7],
                     "group_name": group.get('groupName', ''),
-                    "latitude": info.get('latitude', default_lat),
-                    "longitude": info.get('longitude', default_long),
+                    "latitude": info.get('latitude',''),  # Only set default for root
+                    "longitude": info.get('longitude', ''),  # Only set default for root
                     "has_reminder": "Yes" if info.get('reminder') else "No",
-                    "location_radius": info.get('locationRadius', default_radius),
+                    "location_radius": info.get('locationRadius',''),  # Only set default for root
                     "additional_info": info.get('additionalInfo', ''),
                     "created_on": created_on,
                     "updated_on": updated_on,
                     "requires_gps": "Yes" if info.get('requireTimeEntryGps') in ["self", "self_and_children"] else "No",
                     "requires_gps_children": "Yes" if info.get('requireTimeEntryGps') == "self_and_children" else "No",
-                    "status": "Archived" if project.get('archivedOn') else "Active"
+                    "status": "Archived" if is_archived else "Active"
                 }
             except Exception as e:
                 logging.error(f"Error formatting project data: {e}")
                 return None
 
-        def _process_children(parent: dict, depth: int, project_names: List[str]) -> List[dict]:
+        def filter_children(project: dict) -> dict:
+            """Recursively filter out archived children from active parents"""
+            children = project.get('children', [])
+            if not children:
+                return project
+            
+            # Keep only non-archived children and process them recursively
+            filtered_children = []
+            for child in children:
+                if is_archived:
+                    if child.get('archivedOn'):
+                        # Recursively filter this child's children
+                        filtered_child = filter_children(child.copy())
+                        filtered_children.append(filtered_child)
+                else:
+                    if not child.get('archivedOn'):
+                        # Recursively filter this child's children
+                        filtered_child = filter_children(child.copy())
+                        filtered_children.append(filtered_child)
+            
+            # Replace original children with filtered list
+            project['children'] = filtered_children
+            return project
+
+        def process_hierarchy(project: dict, depth: int, project_names: List[str]) -> List[dict]:
             result = []
-            if not parent or not isinstance(parent, dict):
+            if not project:
                 return result
 
             current_names = project_names.copy()
-            current_names[depth] = parent.get('title', '')
+            current_names[depth] = project.get('title', '')
 
-            if formatted_data := format_project_data(parent, current_names):
+            # Pass is_root flag to format_project_data
+            if formatted_data := format_project_data(project, current_names):
                 result.append(formatted_data)
+            
+            # Filter is_archived children from project
+            project = filter_children(project)
+            
+            children = project.get('children', [])
+            if not children:
+                return result
 
-            children = parent.get('children') or []
-            if children and isinstance(children, list):
-                try:
-                    children = sorted(
-                        children,
-                        key=lambda x: x.get('createdOn', ''),
-                        reverse=True
-                    )
-                    
-                    if not parent.get('archivedOn'):
-                        children = [c for c in children if not c.get('archivedOn')]
-
-                    for child in children:
-                        result.extend(_process_children(child, depth + 1, current_names))
-                except Exception as e:
-                    logging.error(f"Error processing children: {e}")
+            # Sort children by title
+            children = sorted(children, key=lambda x: x.get('title', '',))
+            for child in children:
+                # Children are never root projects
+                result.extend(process_hierarchy(child, depth + 1, current_names))
 
             return result
 
         try:
+            # Process hierarchy
             result = []
-            for project_batch in self._batch_generator(projects, self.process_batch_size):
-                batch_result = []
-                for project in project_batch:
-                    if project:
-                        batch_result.extend(_process_children(project, 0, [""] * 7))
-                result.extend(batch_result)
+            for project in projects:
+                result.extend(process_hierarchy(project, 0, [""] * 7))
+
             return result
+
         except Exception as e:
             logging.error(f"Error in prepare_hierarchy: {e}")
             return []
@@ -191,6 +202,15 @@ class ProjectService:
                                 ...ProjectDetails
                                 children {                  
                                     ...ProjectDetails
+                                    children {                    
+                                        ...ProjectDetails
+                                        children {                      
+                                            ...ProjectDetails
+                                            children {                        
+                                                ...ProjectDetails
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -205,6 +225,7 @@ class ProjectService:
                     createdOn
                     updatedOn
                     projectInfo {
+                        projectId
                         number
                         customer
                         address1
@@ -216,6 +237,9 @@ class ProjectService:
                         reminder
                         requireTimeEntryGps
                         additionalInfo
+                        latitude
+                        locationRadius
+                        longitude
                     }
                     projectGroup {
                         groupName
@@ -225,9 +249,13 @@ class ProjectService:
             "variables": {
                 "filter": {
                     "archivedOn": {"isNull": not is_archived},
-                    "depth": {"equal": 1}
+                    "depth": {"equal": 1},
                 },
-                "sort": [{"title": "asc"}],
+                "sort": [
+                    {"title": "asc"},
+                    {"projectInfo": {"projectId": "asc"}},
+                    {"createdOn": "asc"}
+                ],
                 "first": self.batch_size,
                 "after": after_cursor
             }

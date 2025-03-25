@@ -1,29 +1,33 @@
 function fetchProjectsFromApi(isArchived) {
   const apiKey = getApiKey();
-  if (!apiKey) return [];
+  if (!apiKey) {
+    showError('API key not configured');
+    return [];
+  }
 
-  const API_URL = "YOUR_FASTAPI_SERVER_URL"; // Replace with your FastAPI server URL
   const timezone = Session.getScriptTimeZone();
+  const url = `${CONFIG.API_URL}/api/projects?is_archived=${isArchived}&timezone=${timezone}`;
   
   const options = {
-    method: "get",
+    method: 'get',
     headers: { 
-      "key-authorization": apiKey,
+      'key-authorization': apiKey,
+      'Content-Type': 'application/json'
     },
     muteHttpExceptions: true
   };
 
   try {
-    const url = `${API_URL}/api/projects?is_archived=${isArchived}&timezone=${timezone}`;
     const response = UrlFetchApp.fetch(url, options);
-    const projects = JSON.parse(response.getContentText());
-    
-    if (!projects) {
-      showError(`Failed to fetch ${isArchived ? "archived" : "active"} projects.`);
+    const responseCode = response.getResponseCode();
+
+    if (responseCode !== 200) {
+      showError(`API returned status ${responseCode}`);
       return [];
     }
 
-    return projects;
+    const projects = JSON.parse(response.getContentText());
+    return projects || [];
 
   } catch (error) {
     showError(`Error fetching projects: ${error.message}`);
