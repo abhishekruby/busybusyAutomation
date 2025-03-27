@@ -87,8 +87,9 @@ class ProjectService:
             group = project.get('projectGroup') or {}
 
             try:
-                # Fill empty project names with empty strings
-                project_names.extend([""] * (7 - len(project_names)))
+                # Fill empty project names with empty strings and clean spaces
+                cleaned_names = [name.strip() if name else '' for name in project_names]
+                cleaned_names.extend([''] * (7 - len(cleaned_names)))
 
                 # Format dates
                 created_on = convert_utc_to_timezone(project.get('createdOn'), timezone)
@@ -104,7 +105,7 @@ class ProjectService:
                     "state": info.get('state', ''),
                     "postal_code": info.get('postalCode', ''),
                     "phone": info.get('phone', ''),
-                    "project_names": project_names[:7],
+                    "project_names": cleaned_names[:7],
                     "group_name": group.get('groupName', ''),
                     "latitude": info.get('latitude',''),  # Only set default for root
                     "longitude": info.get('longitude', ''),  # Only set default for root
