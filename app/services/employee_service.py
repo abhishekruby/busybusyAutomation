@@ -12,7 +12,6 @@ class EmployeeService:
     def __init__(self):
         self.url = settings.BUSYBUSY_GRAPHQL_URL
         self.batch_size = 1000
-        self.max_concurrent = 3
 
     async def fetch_employees(self, api_key: str, is_archived: bool, timezone: str) -> List[Dict]:
         try:

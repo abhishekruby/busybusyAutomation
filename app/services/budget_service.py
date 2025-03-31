@@ -11,7 +11,7 @@ class BudgetService:
     def __init__(self):
         self.url = settings.BUSYBUSY_GRAPHQL_URL
         self.batch_size = 1000
-        self.max_concurrent = 3  # Limit concurrent requests
+        self.chunk_size = 50
 
     def _build_project_title(self, project: Dict, ancestors: List[Dict]) -> str:
         """Build hierarchical project title with proper ancestor ordering"""
@@ -32,14 +32,14 @@ class BudgetService:
         return " / ".join(filter(None, path)).strip()
 
     async def fetch_all_budgets(self, api_key: str, is_archived: bool) -> List[Dict]:
-        """Fetch budget data for either archived or active projects"""
+        """Fetch budget data"""
         try:
-            # Fetch only projects matching archive status
+            # Fetch projects first
             projects_data = await self._fetch_budget_projects(api_key, is_archived)
             if not projects_data:
                 return []
 
-            # Store project hierarchy info
+            # Store project hierarchy info 
             project_info = {}
             for project in projects_data:
                 ancestors = project.get('ancestors', [])
@@ -50,52 +50,61 @@ class BudgetService:
                     'ancestors': ancestors
                 }
 
-            # Only fetch data for requested projects
+            # Get project IDs and split into chunks
             project_ids = list(project_info.keys())
+            chunks = [project_ids[i:i + self.chunk_size] 
+                     for i in range(0, len(project_ids), self.chunk_size)]
 
-            # Fetch budget data concurrently
-            hours, costs, progress = await asyncio.gather(
-                self._fetch_all_budget_hours(api_key, project_ids),
-                self._fetch_all_budget_costs(api_key, project_ids),
-                self._fetch_all_progress_budgets(api_key, project_ids)
+            # Process chunks concurrently
+            hours_tasks = [self._fetch_budget_hours_chunk(api_key, chunk) for chunk in chunks]
+            costs_tasks = [self._fetch_budget_costs_chunk(api_key, chunk) for chunk in chunks]
+            progress_tasks = [self._fetch_progress_budgets_chunk(api_key, chunk) for chunk in chunks]
+
+            # Gather all results
+            hours_chunks, costs_chunks, progress_chunks = await asyncio.gather(
+                asyncio.gather(*hours_tasks),
+                asyncio.gather(*costs_tasks),
+                asyncio.gather(*progress_tasks)
             )
+
+            # Combine chunk results
+            hours = [item for chunk in hours_chunks for item in chunk]
+            costs = [item for chunk in costs_chunks for item in chunk]
+            progress = [item for chunk in progress_chunks for item in chunk]
 
             # Get cost codes
             cost_code_ids = {pb.get('costCodeId') for pb in progress if pb.get('costCodeId')}
             cost_codes = await self._fetch_cost_codes(api_key, list(cost_code_ids)) if cost_code_ids else []
-            return self._combine_hierarchical_data(hours, costs, progress, cost_codes, project_info)
+
+            # Format and return data without timezone conversion
+            formatted_data = self._combine_hierarchical_data(hours, costs, progress, cost_codes, project_info)
+            return formatted_data
 
         except Exception as e:
-            logging.error(f"Error fetching budgets: {str(e)}")
+            logging.error(f"Error fetching budgets: {str(e)}", exc_info=True)
             raise
 
-    async def _fetch_all_with_cursor(self, api_key: str, query: dict, key: str) -> List[Dict]:
-        """Fetch all records with cursor pagination and concurrency"""
+    async def _fetch_with_cursor(self, api_key: str, query: dict, key: str) -> List[Dict]:
+        """Fetch all records with cursor pagination"""
         all_data = []
-        semaphore = asyncio.Semaphore(self.max_concurrent)
+        cursor = None
 
-        async def fetch_batch(cursor: Optional[str]) -> Tuple[List[Dict], Optional[str]]:
-            async with semaphore:
+        async with httpx.AsyncClient() as client:
+            while True:
                 current_query = {**query}
                 current_query["variables"]["after"] = cursor
 
-                data = await self._execute_query(api_key, current_query, key)
+                data = await self._execute_query(client, api_key, current_query, key)
                 if not data:
-                    return [], None
+                    break
 
-                next_cursor = data[-1].get("cursor") if len(
-                    data) == self.batch_size else None
-                return data, next_cursor
+                all_data.extend(data)
+                if len(data) < self.batch_size:
+                    break
 
-        cursor = None
-        while True:
-            batch_data, cursor = await fetch_batch(cursor)
-            if not batch_data:
-                break
-
-            all_data.extend(batch_data)
-            if not cursor:
-                break
+                cursor = data[-1].get("cursor")
+                if not cursor:
+                    break
 
         return all_data
 
@@ -126,163 +135,121 @@ class BudgetService:
             """,
             "variables": {
                 "first": self.batch_size,
-                "filter": {
-                    "archivedOn": {"isNull": not is_archived},
-                },
-                "sort": [
-                    {"title": "asc"},
-                    {"createdOn": "asc"}
-                ]
+                "filter": {"archivedOn": {"isNull": not is_archived}},
+                "sort": [{"title": "asc"}, {"createdOn": "asc"}]
             }
         }
-        return await self._fetch_all_with_cursor(api_key, query, "projects")
+        return await self._fetch_with_cursor(api_key, query, "projects")
 
-    async def _fetch_all_budget_hours(self, api_key: str, project_ids: List[str]) -> List[Dict]:
-        # Split project IDs into chunks for parallel processing
-        chunks = [project_ids[i:i + 50]
-                  for i in range(0, len(project_ids), 50)]
-        tasks = []
-
-        for chunk in chunks:
-            query = {
-                "query": """
-                    query budgetHoursQuery($filter: BudgetHoursFilter, $sort: [BudgetHoursSort!], $first: Int, $after: String) {
-                        budgetHours(filter: $filter, sort: $sort, first: $first, after: $after) {
-                            id projectId memberId budgetSeconds costCodeId equipmentId createdOn cursor equipmentBudgetSeconds
-                        }
-                    }
-                """,
-                "variables": {
-                    "first": self.batch_size,
-                    "filter": {
-                        "projectId": {"contains": chunk},
-                        "isLatest": {"equal": True}
-                    },
-                    "sort": [{"createdOn": "desc"}]
-                }
-            }
-            tasks.append(self._fetch_all_with_cursor(
-                api_key, query, "budgetHours"))
-
-        results = await asyncio.gather(*tasks)
-        return [item for sublist in results for item in sublist]
-
-    async def _fetch_all_budget_costs(self, api_key: str, project_ids: List[str]) -> List[Dict]:
-        # Split project IDs into chunks for parallel processing
-        chunks = [project_ids[i:i + 50]
-                  for i in range(0, len(project_ids), 50)]
-        tasks = []
-
-        for chunk in chunks:
-            query = {
-                "query": """
-                    query budgetCostQuery($filter: BudgetCostFilter, $sort: [BudgetCostSort!], $first: Int, $after: String) {
-                        budgetCosts(filter: $filter, sort: $sort, first: $first, after: $after) {
-                            id projectId memberId costBudget costCodeId equipmentId cursor equipmentCostBudget
-                        }
-                    }
-                """,
-                "variables": {
-                    "first": self.batch_size,
-                    "filter": {
-                        "projectId": {"contains": chunk},
-                        "isLatest": {"equal": True}
-                    },
-                    "sort": [{"createdOn": "desc"}]
-                }
-            }
-            tasks.append(self._fetch_all_with_cursor(
-                api_key, query, "budgetCosts"))
-
-        results = await asyncio.gather(*tasks)
-        return [item for sublist in results for item in sublist]
-
-    async def _fetch_all_progress_budgets(self, api_key: str, project_ids: List[str]) -> List[Dict]:
-        # Split project IDs into chunks for parallel processing
-        chunks = [project_ids[i:i + 50]
-                  for i in range(0, len(project_ids), 50)]
-        tasks = []
-
-        for chunk in chunks:
-            query = {
-                "query": """
-                    query GetProgressBudget($filter: ProgressBudgetFilter, $first: Int, $after: String, $sort: [ProgressBudgetSort!]) {
-                        progressBudgets(first: $first, after: $after, filter: $filter, sort: $sort) {
-                            id cursor quantity value projectId costCodeId
-                        }
-                    }
-                """,
-                "variables": {
-                    "first": self.batch_size,
-                    "filter": {
-                        "projectId": {"contains": chunk},
-                        "deletedOn": {"isNull": True}
-                    },
-                    "sort": [{"createdOn": "desc"}]
-                }
-            }
-            tasks.append(self._fetch_all_with_cursor(
-                api_key, query, "progressBudgets"))
-
-        results = await asyncio.gather(*tasks)
-        return [item for sublist in results for item in sublist]
-
-    async def _fetch_cost_codes(self, api_key: str, cost_code_ids: List[str]) -> List[CostCode]:
+    async def _fetch_budget_hours_chunk(self, api_key: str, project_ids: List[str]) -> List[Dict]:
         query = {
             "query": """
-                query GetCostCodes($filter: CostCodeFilter) {
-                    costCodes(filter: $filter) {
-                        id
-                        title
-                        costCode
+                query budgetHoursQuery($filter: BudgetHoursFilter, $sort: [BudgetHoursSort!], $first: Int, $after: String) {
+                    budgetHours(filter: $filter, sort: $sort, first: $first, after: $after) {
+                        id projectId memberId budgetSeconds costCodeId equipmentId createdOn cursor equipmentBudgetSeconds
                     }
                 }
             """,
             "variables": {
+                "first": self.batch_size,
                 "filter": {
-                    "id": {"contains": cost_code_ids}
-                }
+                    "projectId": {"contains": project_ids},
+                    "isLatest": {"equal": True}
+                },
+                "sort": [{"createdOn": "desc"}]
             }
         }
-        return await self._execute_query(api_key, query, "costCodes")
+        return await self._fetch_with_cursor(api_key, query, "budgetHours")
 
-    async def _execute_query(self, api_key: str, query: dict, result_key: str):
-        """Execute GraphQL query with better error handling"""
+    async def _fetch_budget_costs_chunk(self, api_key: str, project_ids: List[str]) -> List[Dict]:
+        query = {
+            "query": """
+                query budgetCostQuery($filter: BudgetCostFilter, $sort: [BudgetCostSort!], $first: Int, $after: String) {
+                    budgetCosts(filter: $filter, sort: $sort, first: $first, after: $after) {
+                        id projectId memberId costBudget costCodeId equipmentId cursor equipmentCostBudget
+                    }
+                }
+            """,
+            "variables": {
+                "first": self.batch_size,
+                "filter": {
+                    "projectId": {"contains": project_ids},
+                    "isLatest": {"equal": True}
+                },
+                "sort": [{"createdOn": "desc"}]
+            }
+        }
+        return await self._fetch_with_cursor(api_key, query, "budgetCosts")
+
+    async def _fetch_progress_budgets_chunk(self, api_key: str, project_ids: List[str]) -> List[Dict]:
+        query = {
+            "query": """
+                query GetProgressBudget($filter: ProgressBudgetFilter, $first: Int, $after: String, $sort: [ProgressBudgetSort!]) {
+                    progressBudgets(first: $first, after: $after, filter: $filter, sort: $sort) {
+                        id cursor quantity value projectId costCodeId
+                    }
+                }
+            """,
+            "variables": {
+                "first": self.batch_size,
+                "filter": {
+                    "projectId": {"contains": project_ids},
+                    "deletedOn": {"isNull": True}
+                },
+                "sort": [{"createdOn": "desc"}]
+            }
+        }
+        return await self._fetch_with_cursor(api_key, query, "progressBudgets")
+
+    async def _fetch_cost_codes(self, api_key: str, cost_code_ids: List[str]) -> List[CostCode]:
         async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(
-                    self.url,
-                    json=query,
-                    headers={
-                        "key-authorization": api_key,
-                        "Content-Type": "application/json"
-                    },
-                    timeout=60.0
-                )
+            query = {
+                "query": """
+                    query GetCostCodes($filter: CostCodeFilter) {
+                        costCodes(filter: $filter) {
+                            id title costCode
+                        }
+                    }
+                """,
+                "variables": {
+                    "filter": {"id": {"contains": cost_code_ids}}
+                }
+            }
+            return await self._execute_query(client, api_key, query, "costCodes")
 
-                response.raise_for_status()
-                data = response.json()
+    async def _execute_query(self, client: httpx.AsyncClient, api_key: str, query: dict, result_key: str):
+        """Execute GraphQL query asynchronously"""
+        try:
+            response = await client.post(
+                self.url,
+                json=query,
+                headers={
+                    "key-authorization": api_key,
+                    "Content-Type": "application/json"
+                },
+                timeout=60.0
+            )
 
-                if "errors" in data and data["errors"]:
-                    error_messages = [
-                        error.get('message', 'Unknown error') for error in data["errors"]]
-                    raise Exception(
-                        f"GraphQL errors: {', '.join(error_messages)}")
+            response.raise_for_status()
+            data = response.json()
 
-                result = data.get("data", {}).get(result_key)
-                if result is None:
-                    logging.warning(f"No {result_key} found in response")
-                    return []
+            if "errors" in data and data["errors"]:
+                error_messages = [error.get('message', 'Unknown error') for error in data["errors"]]
+                raise Exception(f"GraphQL errors: {', '.join(error_messages)}")
 
-                return result
+            result = data.get("data", {}).get(result_key)
+            if result is None:
+                logging.warning(f"No {result_key} found in response")
+                return []
 
-            except httpx.HTTPStatusError as e:
-                logging.error(
-                    f"HTTP error: {e.response.status_code} - {e.response.text}")
-                raise Exception(f"HTTP error {e.response.status_code}")
-            except Exception as e:
-                logging.error(f"Error executing query: {str(e)}")
-                raise
+            return result
+
+        except httpx.HTTPStatusError as e:
+            logging.error(f"HTTP error: {e.response.status_code} - {e.response.text}")
+            raise Exception(f"HTTP error {e.response.status_code}")
+        except Exception as e:
+            logging.error(f"Error executing query: {str(e)}")
+            raise
 
     def _combine_hierarchical_data(self, hours: List[Dict], costs: List[Dict],
                                    progress: List[Dict], cost_codes: List[Dict],
@@ -294,11 +261,11 @@ class BudgetService:
         # Group data by project first
         for proj_id, proj_data in project_info.items():
             # Create base project entry first (without cost codes)
-            project_hours = sum(h.get('budgetSeconds', 0) / 3600 for h in hours 
-                              if h.get('projectId') == proj_id and not h.get('costCodeId'))
-            project_costs = sum(float(c.get('costBudget', 0) or 0) for c in costs 
-                              if c.get('projectId') == proj_id and not c.get('costCodeId'))
-            
+            project_hours = sum(h.get('budgetSeconds', 0) / 3600 for h in hours
+                                if h.get('projectId') == proj_id and not h.get('costCodeId'))
+            project_costs = sum(float(c.get('costBudget', 0) or 0) for c in costs
+                                if c.get('projectId') == proj_id and not c.get('costCodeId'))
+
             combined_data.append({
                 'id': '',
                 'project_id': proj_id,
@@ -314,29 +281,29 @@ class BudgetService:
 
             # Find all cost codes with actual data
             project_cost_codes = set()
-            
+
             # Only add cost codes that have progress values or quantities
             for prog in progress:
-                if (prog.get('projectId') == proj_id 
+                if (prog.get('projectId') == proj_id
                     and prog.get('costCodeId')
-                    and (prog.get('value') or prog.get('quantity'))):
+                        and (prog.get('value') or prog.get('quantity'))):
                     project_cost_codes.add(prog.get('costCodeId'))
 
             # Create entries for each valid cost code
             for cc_id in project_cost_codes:
                 if cc_id in cost_code_map:
                     cost_code = cost_code_map[cc_id]
-                    cc_progress = next((p for p in progress 
-                        if p.get('projectId') == proj_id 
-                        and p.get('costCodeId') == cc_id), {})
-                    
+                    cc_progress = next((p for p in progress
+                                        if p.get('projectId') == proj_id
+                                        and p.get('costCodeId') == cc_id), {})
+
                     if cc_progress:  # Only create entry if there's progress data
-                        cc_hours = next((h for h in hours 
-                            if h.get('projectId') == proj_id 
-                            and h.get('costCodeId') == cc_id), {})
-                        cc_costs = next((c for c in costs 
-                            if c.get('projectId') == proj_id 
-                            and c.get('costCodeId') == cc_id), {})
+                        cc_hours = next((h for h in hours
+                                         if h.get('projectId') == proj_id
+                                         and h.get('costCodeId') == cc_id), {})
+                        cc_costs = next((c for c in costs
+                                         if c.get('projectId') == proj_id
+                                         and c.get('costCodeId') == cc_id), {})
 
                         combined_data.append({
                             'id': cc_progress.get('id', ''),

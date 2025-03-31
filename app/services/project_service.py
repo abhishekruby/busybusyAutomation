@@ -12,9 +12,7 @@ from ..utils.timezone_utils import convert_utc_to_timezone
 class ProjectService:
     def __init__(self):
         self.url = settings.BUSYBUSY_GRAPHQL_URL
-        self.batch_size = 500  # Reset to smaller batch size for stability
-        self.process_batch_size = 2000
-        self.max_concurrent = 5  # Increased concurrent requests
+        self.batch_size = 1000
 
     def _batch_generator(self, items: list, batch_size: int) -> Generator:
         """Generate batches from items"""

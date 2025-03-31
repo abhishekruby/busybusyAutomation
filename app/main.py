@@ -72,8 +72,8 @@ async def get_projects(
 
 @app.get("/api/budgets")
 async def get_budgets(
-    api_key: str = Header(..., alias="key-authorization"),
     is_archived: bool = Query(...),
+    api_key: str = Header(..., alias="key-authorization")
 ):
     """Fetch budget data with timeout handling"""
     try:
@@ -81,23 +81,15 @@ async def get_budgets(
             raise HTTPException(status_code=401, detail="Invalid API key format")
 
         service = BudgetService()
-        logging.info(f"Starting fetch of {('archived' if is_archived else 'active')} budgets")
+        logging.info(f"Starting budget fetch. Archived: {is_archived}")
         
-        # Add timeout
-        timeout = 180  # 3 minutes
-        try:
-            budgets = await asyncio.wait_for(
-                service.fetch_all_budgets(api_key, is_archived), 
-                timeout=timeout
-            )
-            logging.info(f"Fetched {len(budgets)} budget records")
-            return budgets
+        budgets = await service.fetch_all_budgets(api_key, is_archived)
+        logging.info(f"Fetched budget data")
+        
+        if not budgets:
+            return []
             
-        except asyncio.TimeoutError:
-            raise HTTPException(
-                status_code=504,
-                detail=f"Request timed out after {timeout} seconds"
-            )
+        return budgets
         
     except Exception as e:
         logging.exception("Error in get_budgets")
