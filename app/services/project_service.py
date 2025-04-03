@@ -8,6 +8,7 @@ from itertools import islice
 from ..config import settings
 from ..models.project import Project
 from ..utils.timezone_utils import convert_utc_to_timezone
+from ..utils.redis_cache import redis_cache, project_cache
 
 class ProjectService:
     def __init__(self):
@@ -20,7 +21,9 @@ class ProjectService:
         while batch := list(islice(iterator, batch_size)):
             yield batch
 
+    @redis_cache(project_cache)
     async def fetch_projects(self, api_key: str, is_archived: bool) -> List[Project]:
+        """Fetch projects with Redis caching"""
         logging.info(f"Fetching projects from BusyBusy API... {api_key} {is_archived}")
         try:
             all_projects = []

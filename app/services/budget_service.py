@@ -11,7 +11,7 @@ class BudgetService:
     def __init__(self):
         self.url = settings.BUSYBUSY_GRAPHQL_URL
         self.batch_size = 1000
-        self.chunk_size = 50
+        self.chunk_size = 100
 
     def _build_project_title(self, project: Dict, ancestors: List[Dict]) -> str:
         """Build hierarchical project title with proper ancestor ordering"""

@@ -6,6 +6,10 @@ class Settings(BaseSettings):
     BUSYBUSY_GRAPHQL_URL: str = "https://graphql.busybusy.io/"
     ALLOWED_ORIGINS: str = "*"  # For production, set to your Apps Script domain
     APP_URL: str = "https://your-fastapi-server.com"  # Replace with your deployed API URL
+    MAX_BATCH_SIZE: int = 500
+    MAX_CONCURRENT_REQUESTS: int = 10
+    DEFAULT_TIMEOUT: int = 60
+    MAX_MEMORY_PERCENT: float = 80.0  # Maximum memory usage percentage
     
     class Config:
         env_file = ".env"
