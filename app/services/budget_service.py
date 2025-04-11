@@ -5,6 +5,7 @@ from typing import List, Optional, Dict, Tuple
 from datetime import datetime
 from ..config import settings
 from ..models.budget import BudgetHours, BudgetCost, ProgressBudget, CostCode
+from ..utils.redis_cache import redis_cache, budget_cache
 
 
 class BudgetService:
@@ -31,12 +32,14 @@ class BudgetService:
         # Join with / and ensure no extra spaces around separators
         return " / ".join(filter(None, path)).strip()
 
+    @redis_cache(budget_cache)
     async def fetch_all_budgets(self, api_key: str, is_archived: bool) -> List[Dict]:
         """Fetch budget data"""
         try:
             # Fetch projects first
             projects_data = await self._fetch_budget_projects(api_key, is_archived)
             if not projects_data:
+                logging.debug("No projects data found for budgets.")
                 return []
 
             # Store project hierarchy info 
@@ -78,6 +81,14 @@ class BudgetService:
 
             # Format and return data without timezone conversion
             formatted_data = self._combine_hierarchical_data(hours, costs, progress, cost_codes, project_info)
+
+            # Ensure data is JSON-serializable
+            for item in formatted_data:
+                for key, value in item.items():
+                    if isinstance(value, datetime):
+                        item[key] = value.isoformat()
+
+            logging.debug(f"Formatted budget data: {formatted_data}")
             return formatted_data
 
         except Exception as e:

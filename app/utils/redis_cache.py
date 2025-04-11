@@ -17,9 +17,14 @@ try:
         decode_responses=True
     )
     redis_client = redis.Redis(connection_pool=redis_pool)
-    logging.info("Redis connection pool initialized")
+    # Test connection
+    redis_client.ping()
+    logging.info("Redis connection pool initialized successfully")
+except RedisError as e:
+    logging.error(f"Redis connection failed: {str(e)}")
+    redis_client = None
 except Exception as e:
-    logging.error(f"Failed to initialize Redis: {str(e)}")
+    logging.error(f"Unexpected error during Redis initialization: {str(e)}")
     redis_client = None
 
 class RedisCache:
@@ -42,10 +47,12 @@ class RedisCache:
             
         try:
             full_key = self._get_full_key(key)
+            logging.debug(f"Attempting to retrieve cache for key: {full_key}")
             data = redis_client.get(full_key)
             if data:
                 logging.info(f"Cache hit for key: {full_key}")
                 return json.loads(data)
+            logging.info(f"Cache miss for key: {full_key}")
             return None
         except RedisError as e:
             logging.error(f"Redis error in get: {str(e)}")
@@ -65,6 +72,7 @@ class RedisCache:
             
         try:
             full_key = self._get_full_key(key)
+            logging.debug(f"Attempting to cache data for key: {full_key}")
             try:
                 # Try serializing first to catch errors
                 serialized = json.dumps(value)
@@ -168,23 +176,31 @@ def redis_cache(cache_instance: RedisCache):
             
             logging.info(f"Using cache key: {cache_key}")
             
-            # Try to get from cache first
-            cached_result = cache_instance.get(cache_key)
-            if cached_result is not None:
-                logging.info(f"Cache hit for {cache_key}")
-                return cached_result
+            try:
+                # Try to get from cache first
+                cached_result = cache_instance.get(cache_key)
+                if cached_result is not None:
+                    logging.info(f"Cache hit for {cache_key}")
+                    return cached_result
+            except Exception as e:
+                logging.error(f"Cache retrieval failed: {str(e)}")
+                # Continue execution without cache
             
-            logging.info(f"Cache miss for {cache_key}, executing function")
-            # If not in cache, call the function
+            # If not in cache or cache failed, call the function
             result = await func(*args, **kwargs)
             
-            # Cache the result
-            success = cache_instance.set(cache_key, result)
-            if success:
-                logging.info(f"Successfully cached result for {cache_key}")
-            else:
-                logging.warning(f"Failed to cache result for {cache_key}")
+            try:
+                # Try to cache the result
+                logging.debug(f"Attempting to cache result for {cache_key}: {result}")
+                success = cache_instance.set(cache_key, result)
+                if success:
+                    logging.info(f"Successfully cached result for {cache_key}")
+                else:
+                    logging.warning(f"Failed to cache result for {cache_key}")
+            except Exception as e:
+                logging.error(f"Cache storage failed: {str(e)}")
+                # Continue without caching
             
             return result
         return wrapper
-    return decorator 
+    return decorator
