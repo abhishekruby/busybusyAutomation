@@ -5,14 +5,15 @@ from typing import List, Optional, Dict, Tuple
 from datetime import datetime
 from ..config import settings
 from ..models.budget import BudgetHours, BudgetCost, ProgressBudget, CostCode
-from ..utils.redis_cache import redis_cache, budget_cache
+from ..utils.redis_cache import RedisCache
 
 
 class BudgetService:
     def __init__(self):
         self.url = settings.BUSYBUSY_GRAPHQL_URL
-        self.batch_size = 1000
+        self.batch_size = 500
         self.chunk_size = 100
+        self.cache = RedisCache()
 
     def _build_project_title(self, project: Dict, ancestors: List[Dict]) -> str:
         """Build hierarchical project title with proper ancestor ordering"""
@@ -32,9 +33,16 @@ class BudgetService:
         # Join with / and ensure no extra spaces around separators
         return " / ".join(filter(None, path)).strip()
 
-    @redis_cache(budget_cache)
     async def fetch_all_budgets(self, api_key: str, is_archived: bool) -> List[Dict]:
-        """Fetch budget data"""
+        """Fetch budget data with caching"""
+        cache_key = f"budget_data_{'archive' if is_archived else 'active'}"
+        
+        # Try to get from cache first
+        cached_data = await self.cache.get_cached_data(cache_key)
+        if cached_data:
+            logging.info(f"Using cached budget data for {cache_key}")
+            return cached_data
+
         try:
             # Fetch projects first
             projects_data = await self._fetch_budget_projects(api_key, is_archived)
@@ -87,6 +95,10 @@ class BudgetService:
                 for key, value in item.items():
                     if isinstance(value, datetime):
                         item[key] = value.isoformat()
+
+            # Cache the results
+            cache_minutes = 720 if is_archived else 10  # 12 hours for archived, 10 minutes for active
+            await self.cache.set_cached_data(cache_key, formatted_data, cache_minutes)
 
             logging.debug(f"Formatted budget data: {formatted_data}")
             return formatted_data

@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional, List
 from .services.project_service import ProjectService
 from .services.budget_service import BudgetService
@@ -20,7 +22,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Update CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  
@@ -28,6 +29,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)  # Compress responses > 1000 bytes
 
 @app.get("/")
 async def root():
@@ -53,18 +55,12 @@ async def get_projects(
             )
 
         service = ProjectService()
-        logging.info(f"Starting project fetch. Archived: {is_archived}")
-        
-        projects = await service.fetch_projects(api_key, is_archived)
-        logging.info(f"Fetched {len(projects)} projects")
+        projects = await service.fetch_projects(api_key, is_archived, timezone)
         
         if not projects:
             return []
             
-        formatted = service.prepare_hierarchy(projects, timezone, is_archived)
-        logging.info(f"Formatted {len(formatted)} projects")
-        
-        return formatted
+        return projects
         
     except Exception as e:
         logging.exception("Error in get_projects")
